@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3dvr meet — starter</title>
+  <meta name="description" content="Lightweight WebRTC + Gun.js video chat starter with optional recording." />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'%3E%3Crect width='128' height='128' rx='24' fill='%23005cff'/%3E%3Cpath d='M30 64a34 34 0 1 1 68 0 34 34 0 0 1-68 0zm34-22a22 22 0 1 0 0 44 22 22 0 0 0 0-44z' fill='white'/%3E%3C/svg%3E" />
+  <style>
+    :root{
+      --bg:#0b1020; --panel:#121933; --muted:#7b87b9; --text:#e7eefe; --accent:#6aa6ff; --good:#20c997; --warn:#ffcc66; --bad:#ff6b6b;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;font:16px/1.5 system-ui,Segoe UI,Roboto,Inter,Helvetica,Arial;background:linear-gradient(180deg,#0a0f25,#0b1020 35%,#0b0f1a);color:var(--text)}
+    header{position:sticky;top:0;z-index:10;background:rgba(11,16,32,.85);backdrop-filter:saturate(1.2) blur(10px);border-bottom:1px solid #18224a}
+    .wrap{max-width:1200px;margin:auto;padding:16px}
+    h1{margin:0;font-size:20px;letter-spacing:.6px;display:flex;gap:10px;align-items:center}
+    .badge{font-size:12px;color:#0b1020;background:var(--accent);padding:2px 8px;border-radius:999px}
+
+    .controls{display:grid;grid-template-columns:repeat(12,1fr);gap:10px;margin-top:12px}
+    .controls > *{min-width:0}
+    input,select,button{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #233062;background:#0f1630;color:var(--text);outline:none}
+    input::placeholder{color:#8992c1}
+    button{cursor:pointer;border:1px solid #2b3a78;background:#16214a;transition:.2s}
+    button:hover{filter:brightness(1.1)}
+    button[aria-pressed="true"],.on{background:#15315f;border-color:#2f5fb7}
+    button.good{background:#0f2d25;border-color:#1e8a6d}
+    button.warn{background:#3a2a0f;border-color:#b68a2a}
+    button.danger{background:#311316;border-color:#9e2d2f}
+
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;padding:16px}
+    .tile{position:relative;aspect-ratio:16/9;background:linear-gradient(180deg,#101936,#0b1229);border:1px solid #1a2450;border-radius:14px;overflow:hidden}
+    .tile video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000}
+    .label{position:absolute;left:10px;bottom:10px;padding:4px 8px;border-radius:8px;background:rgba(0,0,0,.5);backdrop-filter:blur(4px);font-size:12px}
+
+    .footer{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:16px;border-top:1px solid #18224a}
+    .hint{color:var(--muted);font-size:12px}
+    .pill{padding:6px 10px;border:1px dashed #2a396f;border-radius:999px}
+
+    @media (max-width:640px){ .controls{grid-template-columns:1fr 1fr} .controls .span-3{grid-column:1/-1}}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <h1>
+        3dvr meet <span class="badge">starter</span>
+      </h1>
+      <div class="controls">
+        <input id="displayName" placeholder="Your name (optional)" />
+        <input id="room" placeholder="Room ID (e.g. demo)" />
+        <button id="joinBtn" class="good">Join</button>
+        <button id="leaveBtn" class="danger" disabled>Leave</button>
+        <button id="toggleCam" disabled>Cam</button>
+        <button id="toggleMic" disabled>Mic</button>
+        <button id="shareScreen" disabled>Share Screen</button>
+        <button id="recStart" class="warn" disabled>Start Rec</button>
+        <button id="recStop" class="danger" disabled>Stop Rec</button>
+        <button id="downloadBtn" disabled>Download</button>
+        <div class="pill span-3" id="status">Idle.</div>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="grid" id="videos">
+      <!-- Video tiles will be injected here -->
+    </section>
+  </main>
+
+  <footer class="wrap footer">
+    <span class="hint">Peer-to-peer via WebRTC. Signaling via Gun.js. Recording is client-side only.</span>
+  </footer>
+
+  <!-- Gun.js (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/gun/gun.js"></script>
+  <script>
+    // --- Utility ---
+    const $ = (sel) => document.querySelector(sel);
+    const status = (t) => { document.getElementById('status').textContent = t }
+    const uuid = () => crypto.randomUUID().slice(0,8);
+
+    // --- Elements ---
+    const el = {
+      name: $('#displayName'), room: $('#room'),
+      join: $('#joinBtn'), leave: $('#leaveBtn'),
+      cam: $('#toggleCam'), mic: $('#toggleMic'),
+      screen: $('#shareScreen'),
+      recStart: $('#recStart'), recStop: $('#recStop'), dl: $('#downloadBtn'),
+      videos: $('#videos')
+    };
+
+    // --- State ---
+    const me = { id: uuid(), name: '', room: null, joined:false };
+    const peers = new Map(); // id -> {pc, stream, videos: {tile, el}}
+    let localStream = null;
+    let screenStream = null;
+
+    // Recording state
+    let mixerCanvas, mixerCtx, mixRAF;
+    let audioCtx, mixDest, mediaRecorder, chunks = [];
+
+    // --- Gun setup (signaling only) ---
+    const gun = Gun({ peers: [/* add your peers if you run relays; public works too */] });
+
+    function roomNode(room){ return gun.get('3dvr-meet').get(room); }
+
+    // --- UI helpers ---
+    function addVideoTile(id, label){
+      const tile = document.createElement('div'); tile.className='tile'; tile.id = `tile-${id}`;
+      const v = document.createElement('video'); v.autoplay = true; v.playsInline = true; v.muted = (id==='me');
+      const tag = document.createElement('div'); tag.className='label'; tag.textContent = label || id;
+      tile.appendChild(v); tile.appendChild(tag);
+      el.videos.appendChild(tile);
+      return { tile, v };
+    }
+    function removeVideoTile(id){ const t = document.getElementById(`tile-${id}`); if(t) t.remove(); }
+
+    // --- Media setup ---
+    async function getUserMediaIfNeeded(){
+      if(localStream) return localStream;
+      localStream = await navigator.mediaDevices.getUserMedia({video:true,audio:true});
+      const meTile = addVideoTile('me', me.name || 'Me');
+      meTile.v.srcObject = localStream;
+      peers.set('me', { stream: localStream, videos: meTile });
+      el.cam.disabled = el.mic.disabled = el.screen.disabled = false;
+      el.recStart.disabled = false;
+      return localStream;
+    }
+
+    // --- WebRTC core ---
+    const rtcConfig = { iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' }
+    ]};
+
+    async function createPeerConnection(peerId){
+      const pc = new RTCPeerConnection(rtcConfig);
+
+      // Add our current tracks
+      (localStream?.getTracks() || []).forEach(t => pc.addTrack(t, localStream));
+      (screenStream?.getTracks() || []).forEach(t => pc.addTrack(t, screenStream));
+
+      // Remote tracks
+      const remoteId = peerId;
+      let remoteStream = new MediaStream();
+      pc.ontrack = (e)=>{
+        e.streams[0].getTracks().forEach(tr=>remoteStream.addTrack(tr));
+        let p = peers.get(remoteId);
+        if(!p){
+          const tile = addVideoTile(remoteId, remoteId);
+          p = { pc, stream: remoteStream, videos: tile };
+          peers.set(remoteId, p);
+        }
+        p.videos.v.srcObject = remoteStream;
+      };
+
+      pc.onicecandidate = (e)=>{
+        if(e.candidate){
+          roomNode(me.room).get('signals').get(remoteId).set({
+            from: me.id, type: 'ice', candidate: e.candidate
+          });
+        }
+      };
+      pc.onconnectionstatechange = ()=>{
+        status(`Peer ${remoteId}: ${pc.connectionState}`);
+        if(['failed','disconnected','closed'].includes(pc.connectionState)){
+          removeVideoTile(remoteId);
+          peers.delete(remoteId);
+        }
+      }
+      return pc;
+    }
+
+    // --- Signaling (Gun.js) ---
+    function startSignaling(){
+      const room = roomNode(me.room);
+
+      // Listen for new members
+      room.get('members').map().on((val, id)=>{
+        if(!val) return; if(id===me.id) return; if(!me.joined) return;
+        // Initiate connection if we see someone and we have a lower id (simple deterministic rule)
+        if(me.id < id && !peers.get(id)){
+          dial(id).catch(console.error);
+        }
+      });
+
+      // Listen for signals directed to me
+      room.get('signals').get(me.id).map().on(async (sig)=>{
+        if(!sig) return;
+        const { from, type } = sig;
+        if(from === me.id) return;
+        let p = peers.get(from);
+        if(type==='offer'){
+          if(!p){
+            const pc = await createPeerConnection(from);
+            peers.set(from, { pc });
+            p = peers.get(from);
+          }
+          await p.pc.setRemoteDescription(new RTCSessionDescription(sig.sdp));
+          const answer = await p.pc.createAnswer();
+          await p.pc.setLocalDescription(answer);
+          room.get('signals').get(from).set({ from: me.id, type:'answer', sdp: p.pc.localDescription });
+        } else if(type==='answer'){
+          if(p){ await p.pc.setRemoteDescription(new RTCSessionDescription(sig.sdp)); }
+        } else if(type==='ice'){
+          if(p && sig.candidate){ try{ await p.pc.addIceCandidate(sig.candidate); }catch(e){console.warn(e)} }
+        }
+      });
+    }
+
+    async function dial(peerId){
+      const pc = await createPeerConnection(peerId);
+      peers.set(peerId, { pc });
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      roomNode(me.room).get('signals').get(peerId).set({ from: me.id, type:'offer', sdp: offer });
+    }
+
+    // --- Join / Leave ---
+    async function join(){
+      const room = (el.room.value || location.hash.slice(1) || 'demo').trim();
+      me.room = room; me.name = el.name.value.trim() || `guest-${me.id}`;
+      await getUserMediaIfNeeded();
+      startSignaling();
+      // Advertise ourselves
+      roomNode(room).get('members').get(me.id).put({ name: me.name, at: Date.now() });
+      me.joined = true;
+      status(`Joined room: ${room} as ${me.name}`);
+      el.join.disabled = true; el.leave.disabled = false;
+      history.replaceState(null, '', `#${encodeURIComponent(room)}`);
+    }
+
+    async function leave(){
+      me.joined = false;
+      // Close PCs
+      for(const [id, p] of [...peers]){
+        if(p.pc) try{ p.pc.close(); }catch{}
+        if(id!=='me') removeVideoTile(id);
+        peers.delete(id);
+      }
+      // Stop screen
+      if(screenStream){ screenStream.getTracks().forEach(t=>t.stop()); screenStream=null; }
+      // Remove from room
+      if(me.room) roomNode(me.room).get('members').get(me.id).put(null);
+      el.join.disabled = false; el.leave.disabled = true;
+      status('Left room.');
+    }
+
+    // --- Controls ---
+    el.join.onclick = join;
+    el.leave.onclick = leave;
+
+    el.cam.onclick = ()=>{
+      if(!localStream) return;
+      const v = localStream.getVideoTracks()[0]; if(!v) return;
+      v.enabled = !v.enabled; el.cam.setAttribute('aria-pressed', String(!v.enabled));
+    };
+    el.mic.onclick = ()=>{
+      if(!localStream) return;
+      const a = localStream.getAudioTracks()[0]; if(!a) return;
+      a.enabled = !a.enabled; el.mic.setAttribute('aria-pressed', String(!a.enabled));
+    };
+    el.screen.onclick = async ()=>{
+      try{
+        if(!screenStream){
+          screenStream = await navigator.mediaDevices.getDisplayMedia({video:true,audio:true});
+          // Show our own screen as a tile
+          const id = 'screen';
+          const tile = addVideoTile(id, 'My Screen');
+          tile.v.srcObject = screenStream;
+          peers.set(id, { stream: screenStream, videos: tile });
+          // Add to all PCs
+          for(const [,p] of peers){ if(p.pc){ screenStream.getTracks().forEach(t=>p.pc.addTrack(t, screenStream)); } }
+          screenStream.getVideoTracks()[0].addEventListener('ended', ()=>{ // cleanup on stop
+            removeVideoTile('screen'); peers.delete('screen');
+            for(const [,p] of peers){ if(p.pc){ p.pc.getSenders().forEach(s=>{ if(s.track && s.track.kind==='video' && s.track.label.includes('Screen')) s.replaceTrack(null); }); } }
+            screenStream=null; status('Screen share stopped.');
+          });
+        } else {
+          screenStream.getTracks().forEach(t=>t.stop()); screenStream=null; removeVideoTile('screen');
+        }
+      }catch(e){ console.error(e); status('Screen share blocked.'); }
+    };
+
+    // --- Recording (client-side) ---
+    function buildMixer(){
+      mixerCanvas = document.createElement('canvas');
+      mixerCanvas.width = 1920; mixerCanvas.height = 1080;
+      mixerCtx = mixerCanvas.getContext('2d');
+
+      // Audio mix
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      mixDest = audioCtx.createMediaStreamDestination();
+
+      // For each available MediaStream with audio, connect to mix
+      function connectAudioFrom(stream){
+        try {
+          const src = audioCtx.createMediaStreamSource(stream);
+          const gain = audioCtx.createGain(); gain.gain.value = 1.0; // simple unity gain
+          src.connect(gain).connect(mixDest);
+        } catch(err){ /* streams without audio will throw */ }
+      }
+
+      // Connect current streams
+      for(const [id,p] of peers){ if(p?.stream) connectAudioFrom(p.stream); }
+
+      // Observe future streams
+      const observer = new MutationObserver(()=>{
+        // reconnect on layout changes (naive approach)
+      });
+      observer.observe(el.videos,{childList:true});
+
+      const draw = ()=>{
+        const tiles = [...el.videos.querySelectorAll('video')];
+        const n = Math.max(1, tiles.length);
+        mixerCtx.fillStyle = '#000'; mixerCtx.fillRect(0,0,mixerCanvas.width,mixerCanvas.height);
+        const cols = Math.ceil(Math.sqrt(n));
+        const rows = Math.ceil(n/cols);
+        const w = mixerCanvas.width / cols, h = mixerCanvas.height / rows;
+        tiles.forEach((vid,i)=>{
+          const x = (i%cols)*w, y = Math.floor(i/cols)*h;
+          try { mixerCtx.drawImage(vid, x, y, w, h); } catch{}
+        });
+        mixRAF = requestAnimationFrame(draw);
+      };
+      draw();
+
+      const videoStream = mixerCanvas.captureStream(30);
+      const mixed = new MediaStream([
+        ...videoStream.getVideoTracks(),
+        ...mixDest.stream.getAudioTracks()
+      ]);
+      return mixed;
+    }
+
+    let lastBlob=null;
+    el.recStart.onclick = ()=>{
+      const stream = buildMixer();
+      chunks = [];
+      const opts = { mimeType: 'video/webm;codecs=vp9,opus' };
+      try{ mediaRecorder = new MediaRecorder(stream, opts); }
+      catch(e){ mediaRecorder = new MediaRecorder(stream); }
+      mediaRecorder.ondataavailable = (e)=>{ if(e.data.size) chunks.push(e.data); };
+      mediaRecorder.onstop = ()=>{
+        cancelAnimationFrame(mixRAF);
+        lastBlob = new Blob(chunks, {type:'video/webm'});
+        el.dl.disabled = false; status(`Recording ready: ${(lastBlob.size/1e6).toFixed(1)} MB`);
+      };
+      mediaRecorder.start(1000);
+      el.recStart.disabled = true; el.recStop.disabled = false; status('Recording…');
+    };
+    el.recStop.onclick = ()=>{ if(mediaRecorder && mediaRecorder.state!=='inactive') mediaRecorder.stop(); el.recStop.disabled = true; el.recStart.disabled = false; };
+    el.dl.onclick = ()=>{
+      if(!lastBlob) return; const url = URL.createObjectURL(lastBlob);
+      const a = document.createElement('a'); a.href=url; a.download=`3dvr-meet-${Date.now()}.webm`; a.click();
+      setTimeout(()=>URL.revokeObjectURL(url), 30000);
+    }
+
+    // Auto-fill room from hash
+    window.addEventListener('DOMContentLoaded',()=>{
+      const r = location.hash.slice(1); if(r) el.room.value = decodeURIComponent(r);
+    });
+  </script>
+</body>
+</html>
