@@ -144,6 +144,16 @@
       return out;
     }
 
+    function listsEqual(a, b){
+      if(a === b) return true;
+      if(!Array.isArray(a) || !Array.isArray(b)) return false;
+      if(a.length !== b.length) return false;
+      for(let i=0;i<a.length;i++){
+        if(a[i] !== b[i]) return false;
+      }
+      return true;
+    }
+
     function loadStoredRelays(){
       try {
         const raw = localStorage.getItem(RELAY_STORAGE_KEY);
@@ -185,12 +195,7 @@
     }
 
     const DEFAULT_GUN_RELAYS = [
-      'https://3dvr-relay.fly.dev/gun',
-      'https://gun.eco/gun',
-      'https://gun-us.herokuapp.com/gun',
-      'https://gun-eu.herokuapp.com/gun',
-      'https://gunjs.herokuapp.com/gun',
-      'https://gun-manhattan.herokuapp.com/gun'
+      'https://3dvr-relay.fly.dev/gun'
     ];
 
     const normalizedDefaultRelays = uniqueList(DEFAULT_GUN_RELAYS.map(normalizeRelayUrl).filter(Boolean));
@@ -220,22 +225,36 @@
       videos: $('#videos')
     };
 
+    function setCustomRelays(list, { announce = true } = {}){
+      const normalized = uniqueList((list || []).map(normalizeRelayUrl).filter(Boolean));
+      if(listsEqual(normalized, customRelayList)){
+        return normalized;
+      }
+      customRelayList = normalized;
+      persistRelays(normalized);
+      applyActivePeers(computeActivePeers(normalized));
+      if(announce){
+        if(normalized.length){
+          const plural = normalized.length === 1 ? '' : 's';
+          status(`Using ${normalized.length} custom relay${plural}.`);
+        } else {
+          status('Cleared custom relay preferences. Using default relay.');
+        }
+      }
+      return normalized;
+    }
+
     if(el.relays){
       if(customRelayList.length){
         el.relays.value = customRelayList.join(', ');
+      } else if(normalizedDefaultRelays.length){
+        el.relays.placeholder = normalizedDefaultRelays.join(', ');
       }
-      el.relays.addEventListener('change', ()=>{
-        const parsed = parseRelayInput(el.relays.value);
-        customRelayList = parsed;
-        persistRelays(parsed);
-        applyActivePeers(computeActivePeers(parsed));
-        if(parsed.length){
-          const plural = parsed.length === 1 ? '' : 's';
-          status(`Saved ${parsed.length} custom relay${plural}.`);
-        } else {
-          status('Cleared custom relay preferences. Using defaults.');
-        }
-      });
+      const relayInputHandler = ()=>{
+        setCustomRelays(parseRelayInput(el.relays.value));
+      };
+      el.relays.addEventListener('change', relayInputHandler);
+      el.relays.addEventListener('blur', relayInputHandler);
     }
 
     // --- State ---
@@ -355,15 +374,6 @@
     let audioCtx, mixDest, mediaRecorder, chunks = [];
 
     // --- Gun setup (signaling only) ---
-    const GUN_PEERS = [
-      'https://3dvr-relay.fly.dev/gun',
-      'https://gun.eco/gun',
-      'https://gun-us.herokuapp.com/gun',
-      'https://gun-eu.herokuapp.com/gun',
-      'https://gunjs.herokuapp.com/gun',
-      'https://gun-manhattan.herokuapp.com/gun'
-    ];
-
     const gun = Gun({
       peers: activeGunPeers,
       localStorage: false,
@@ -388,7 +398,8 @@
         const label = hosts.length === 1 ? 'relay' : 'relays';
         setRelayStatus(`Connected to signaling ${label}: ${listed}${suffix}`);
       } else {
-        const msg = sawRelayConnection ? 'Reconnecting to signaling relays…' : 'Connecting to signaling relays…';
+        const targetLabel = activeGunPeers.length === 1 ? 'relay' : 'relays';
+        const msg = sawRelayConnection ? `Reconnecting to signaling ${targetLabel}…` : `Connecting to signaling ${targetLabel}…`;
         setRelayStatus(msg);
       }
     }
@@ -588,6 +599,9 @@
     // --- Join / Leave ---
     async function join(){
       if(me.joined){ status(`Already in room: ${me.room}`); return; }
+      if(el.relays){
+        setCustomRelays(parseRelayInput(el.relays.value), { announce: false });
+      }
       const room = (el.room.value || location.hash.slice(1) || 'demo').trim();
       me.room = room; me.name = el.name.value.trim() || `guest-${me.id}`;
       await getUserMediaIfNeeded();
