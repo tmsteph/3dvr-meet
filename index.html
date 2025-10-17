@@ -92,7 +92,23 @@
 
     // --- State ---
     const me = { id: uuid(), name: '', room: null, joined:false };
-    const peers = new Map(); // id -> {pc, stream, videos: {tile, el}}
+    const peers = new Map(); // id -> {pc?, stream?, videos?, meta?, dialing?, pendingIce?}
+
+    function ensurePeerRecord(id){
+      let record = peers.get(id);
+      if(!record){
+        record = {};
+        peers.set(id, record);
+      }
+      return record;
+    }
+
+    function updatePeerTileLabel(id){
+      const record = peers.get(id);
+      if(record?.videos){
+        record.videos.label.textContent = (record.meta?.name) || id;
+      }
+    }
     let localStream = null;
     let screenStream = null;
 
@@ -114,7 +130,7 @@
       const tag = document.createElement('div'); tag.className='label'; tag.textContent = label || id;
       tile.appendChild(v); tile.appendChild(tag);
       el.videos.appendChild(tile);
-      return { tile, v };
+      return { tile, v, label: tag };
     }
     function removeVideoTile(id){ const t = document.getElementById(`tile-${id}`); if(t) t.remove(); }
 
@@ -137,6 +153,8 @@
 
     async function createPeerConnection(peerId){
       const pc = new RTCPeerConnection(rtcConfig);
+      const record = ensurePeerRecord(peerId);
+      record.pc = pc;
 
       // Add our current tracks
       (localStream?.getTracks() || []).forEach(t => pc.addTrack(t, localStream));
@@ -144,16 +162,23 @@
 
       // Remote tracks
       const remoteId = peerId;
-      let remoteStream = new MediaStream();
       pc.ontrack = (e)=>{
-        e.streams[0].getTracks().forEach(tr=>remoteStream.addTrack(tr));
-        let p = peers.get(remoteId);
-        if(!p){
-          const tile = addVideoTile(remoteId, remoteId);
-          p = { pc, stream: remoteStream, videos: tile };
-          peers.set(remoteId, p);
+        const entry = ensurePeerRecord(remoteId);
+        entry.pc = pc;
+        if(!entry.stream){ entry.stream = new MediaStream(); }
+        const inbound = e.streams?.[0];
+        if(inbound){
+          inbound.getTracks().forEach(tr=>{
+            if(!entry.stream.getTrackById(tr.id)) entry.stream.addTrack(tr);
+          });
+        } else if(e.track && !entry.stream.getTrackById(e.track.id)){
+          entry.stream.addTrack(e.track);
         }
-        p.videos.v.srcObject = remoteStream;
+        if(!entry.videos){
+          entry.videos = addVideoTile(remoteId, entry.meta?.name || remoteId);
+        }
+        entry.videos.v.srcObject = entry.stream;
+        updatePeerTileLabel(remoteId);
       };
 
       pc.onicecandidate = (e)=>{
@@ -166,6 +191,8 @@
       pc.onconnectionstatechange = ()=>{
         status(`Peer ${remoteId}: ${pc.connectionState}`);
         if(['failed','disconnected','closed'].includes(pc.connectionState)){
+          const entry = peers.get(remoteId);
+          if(entry?.stream){ entry.stream.getTracks().forEach(t=>t.stop()); }
           removeVideoTile(remoteId);
           peers.delete(remoteId);
         }
@@ -179,10 +206,25 @@
 
       // Listen for new members
       room.get('members').map().on((val, id)=>{
-        if(!val) return; if(id===me.id) return; if(!me.joined) return;
+        if(id===me.id) return;
+        if(!val){
+          const existing = peers.get(id);
+          if(existing?.stream){ existing.stream.getTracks().forEach(t=>t.stop()); }
+          if(existing?.videos) removeVideoTile(id);
+          peers.delete(id);
+          return;
+        }
+        const entry = ensurePeerRecord(id);
+        entry.meta = val;
+        updatePeerTileLabel(id);
+        if(!me.joined) return;
         // Initiate connection if we see someone and we have a lower id (simple deterministic rule)
-        if(me.id < id && !peers.get(id)){
-          dial(id).catch(console.error);
+        if(me.id < id && !entry.pc && !entry.dialing){
+          entry.dialing = true;
+          dial(id).catch(err=>{
+            console.error(err);
+            entry.dialing = false;
+          });
         }
       });
 
@@ -191,31 +233,54 @@
         if(!sig) return;
         const { from, type } = sig;
         if(from === me.id) return;
-        let p = peers.get(from);
+        const entry = ensurePeerRecord(from);
         if(type==='offer'){
-          if(!p){
-            const pc = await createPeerConnection(from);
-            peers.set(from, { pc });
-            p = peers.get(from);
+          if(!entry.pc){
+            await createPeerConnection(from);
           }
-          await p.pc.setRemoteDescription(new RTCSessionDescription(sig.sdp));
-          const answer = await p.pc.createAnswer();
-          await p.pc.setLocalDescription(answer);
-          room.get('signals').get(from).set({ from: me.id, type:'answer', sdp: p.pc.localDescription });
+          await entry.pc.setRemoteDescription(new RTCSessionDescription(sig.sdp));
+          const answer = await entry.pc.createAnswer();
+          await entry.pc.setLocalDescription(answer);
+          room.get('signals').get(from).set({ from: me.id, type:'answer', sdp: entry.pc.localDescription });
+          if(entry.pendingIce?.length){
+            for(const candidate of entry.pendingIce){
+              try{ await entry.pc.addIceCandidate(candidate); }catch(e){ console.warn(e); }
+            }
+            entry.pendingIce = [];
+          }
         } else if(type==='answer'){
-          if(p){ await p.pc.setRemoteDescription(new RTCSessionDescription(sig.sdp)); }
+          if(entry.pc){
+            await entry.pc.setRemoteDescription(new RTCSessionDescription(sig.sdp));
+            if(entry.pendingIce?.length){
+              for(const candidate of entry.pendingIce){
+                try{ await entry.pc.addIceCandidate(candidate); }catch(e){ console.warn(e); }
+              }
+              entry.pendingIce = [];
+            }
+          }
         } else if(type==='ice'){
-          if(p && sig.candidate){ try{ await p.pc.addIceCandidate(sig.candidate); }catch(e){console.warn(e)} }
+          if(sig.candidate){
+            if(entry.pc){
+              try{ await entry.pc.addIceCandidate(sig.candidate); }catch(e){ console.warn(e); }
+            } else {
+              entry.pendingIce = entry.pendingIce || [];
+              entry.pendingIce.push(sig.candidate);
+            }
+          }
         }
       });
     }
 
     async function dial(peerId){
-      const pc = await createPeerConnection(peerId);
-      peers.set(peerId, { pc });
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      roomNode(me.room).get('signals').get(peerId).set({ from: me.id, type:'offer', sdp: offer });
+      const entry = ensurePeerRecord(peerId);
+      try{
+        const pc = await createPeerConnection(peerId);
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        roomNode(me.room).get('signals').get(peerId).set({ from: me.id, type:'offer', sdp: offer });
+      } finally {
+        entry.dialing = false;
+      }
     }
 
     // --- Join / Leave ---
