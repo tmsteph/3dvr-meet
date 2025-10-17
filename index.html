@@ -54,6 +54,7 @@
         <button id="toggleCam" disabled>Cam</button>
         <button id="toggleMic" disabled>Mic</button>
         <button id="shareScreen" disabled>Share Screen</button>
+        <button id="testLink" disabled>Test Link</button>
         <button id="recStart" class="warn" disabled>Start Rec</button>
         <button id="recStop" class="danger" disabled>Stop Rec</button>
         <button id="downloadBtn" disabled>Download</button>
@@ -87,12 +88,15 @@
       cam: $('#toggleCam'), mic: $('#toggleMic'),
       screen: $('#shareScreen'),
       recStart: $('#recStart'), recStop: $('#recStop'), dl: $('#downloadBtn'),
+      test: $('#testLink'),
       videos: $('#videos')
     };
 
     // --- State ---
     const me = { id: uuid(), name: '', room: null, joined:false };
-    const peers = new Map(); // id -> {pc?, stream?, videos?, meta?, dialing?, pendingIce?}
+    const peers = new Map(); // id -> {pc?, stream?, videos?, meta?, dialing?, pendingIce?, dc?}
+    const testState = { value:false, actor:null };
+    const pendingAcks = new Map();
 
     function ensurePeerRecord(id){
       let record = peers.get(id);
@@ -108,6 +112,81 @@
       if(record?.videos){
         record.videos.label.textContent = (record.meta?.name) || id;
       }
+    }
+
+    function updateTestButton(){
+      const label = testState.value ? `Link test ON${testState.actor ? ` (${testState.actor})` : ''}` : 'Test Link';
+      el.test.textContent = label;
+      el.test.classList.toggle('on', !!testState.value);
+      el.test.setAttribute('aria-pressed', String(!!testState.value));
+    }
+
+    function setTestState(value, actor){
+      testState.value = value;
+      testState.actor = actor || null;
+      updateTestButton();
+    }
+
+    function broadcastData(payload){
+      const message = JSON.stringify(payload);
+      for(const [, entry] of peers){
+        const dc = entry.dc;
+        if(dc && dc.readyState === 'open'){
+          try { dc.send(message); } catch(err){ console.warn('Data send failed', err); }
+        }
+      }
+    }
+
+    function handleDataMessage(peerId, raw){
+      let msg;
+      try {
+        msg = JSON.parse(raw);
+      } catch(err){
+        console.warn('Invalid data message', err);
+        return;
+      }
+      if(msg.type === 'test-toggle'){
+        const actor = msg.name || peers.get(peerId)?.meta?.name || peerId;
+        setTestState(!!msg.value, actor);
+        status(`Test toggled ${msg.value ? 'on' : 'off'} by ${actor}`);
+        const record = peers.get(peerId);
+        if(record?.dc && record.dc.readyState === 'open' && msg.id){
+          record.dc.send(JSON.stringify({
+            type: 'test-ack', id: msg.id, value: !!msg.value,
+            from: me.id, name: me.name
+          }));
+        }
+      } else if(msg.type === 'test-ack'){
+        if(msg.id && pendingAcks.has(msg.id)){
+          const timer = pendingAcks.get(msg.id);
+          clearTimeout(timer);
+          pendingAcks.delete(msg.id);
+          const actor = msg.name || peers.get(peerId)?.meta?.name || peerId;
+          status(`Ack from ${actor}`);
+        }
+      } else if(msg.type === 'test-sync'){
+        const actor = msg.name || peers.get(peerId)?.meta?.name || peerId;
+        setTestState(!!msg.value, actor);
+      }
+    }
+
+    function setupDataChannel(peerId, channel){
+      const record = ensurePeerRecord(peerId);
+      record.dc = channel;
+      channel.onmessage = (event)=> handleDataMessage(peerId, event.data);
+      channel.onopen = ()=>{
+        status(`Data channel open with ${record.meta?.name || peerId}`);
+        try {
+          channel.send(JSON.stringify({
+            type: 'test-sync', value: testState.value,
+            from: me.id, name: me.name
+          }));
+        } catch(err){ console.warn('Sync send failed', err); }
+      };
+      channel.onclose = ()=>{
+        if(record.dc === channel){ delete record.dc; }
+      };
+      channel.onerror = (err)=> console.warn('Data channel error', err);
     }
     let localStream = null;
     let screenStream = null;
@@ -188,14 +267,22 @@
           });
         }
       };
+      pc.ondatachannel = (event)=>{
+        setupDataChannel(remoteId, event.channel);
+      };
       pc.onconnectionstatechange = ()=>{
         status(`Peer ${remoteId}: ${pc.connectionState}`);
         if(['failed','disconnected','closed'].includes(pc.connectionState)){
           const entry = peers.get(remoteId);
           if(entry?.stream){ entry.stream.getTracks().forEach(t=>t.stop()); }
+          if(entry?.dc && entry.dc.readyState !== 'closed'){ try { entry.dc.close(); } catch{} }
           removeVideoTile(remoteId);
           peers.delete(remoteId);
         }
+      }
+      if(me.id < peerId && !record.dc){
+        const channel = pc.createDataChannel('control', { ordered: true });
+        setupDataChannel(peerId, channel);
       }
       return pc;
     }
@@ -210,6 +297,7 @@
         if(!val){
           const existing = peers.get(id);
           if(existing?.stream){ existing.stream.getTracks().forEach(t=>t.stop()); }
+          if(existing?.dc && existing.dc.readyState !== 'closed'){ try { existing.dc.close(); } catch{} }
           if(existing?.videos) removeVideoTile(id);
           peers.delete(id);
           return;
@@ -295,6 +383,8 @@
       roomNode(room).get('members').get(me.id).put({ name: me.name, at: Date.now() });
       status(`Joined room: ${room} as ${me.name}`);
       el.join.disabled = true; el.leave.disabled = false;
+      el.test.disabled = false;
+      updateTestButton();
       history.replaceState(null, '', `#${encodeURIComponent(room)}`);
     }
 
@@ -311,6 +401,10 @@
       // Remove from room
       if(me.room) roomNode(me.room).get('members').get(me.id).put(null);
       el.join.disabled = false; el.leave.disabled = true;
+      el.test.disabled = true;
+      for(const [,timer] of pendingAcks){ clearTimeout(timer); }
+      pendingAcks.clear();
+      setTestState(false, null);
       status('Left room.');
     }
 
@@ -346,8 +440,24 @@
           });
         } else {
           screenStream.getTracks().forEach(t=>t.stop()); screenStream=null; removeVideoTile('screen');
+      }
+    }catch(e){ console.error(e); status('Screen share blocked.'); }
+    };
+
+    el.test.onclick = ()=>{
+      if(el.test.disabled) return;
+      const next = !testState.value;
+      setTestState(next, 'You');
+      const id = uuid();
+      const timer = setTimeout(()=>{
+        if(pendingAcks.has(id)){
+          pendingAcks.delete(id);
+          status('No acknowledgement yet.');
         }
-      }catch(e){ console.error(e); status('Screen share blocked.'); }
+      }, 5000);
+      pendingAcks.set(id, timer);
+      broadcastData({ type: 'test-toggle', value: next, id, from: me.id, name: me.name });
+      status(`Sent test ${next ? 'on' : 'off'} toggle…`);
     };
 
     // --- Recording (client-side) ---
@@ -423,6 +533,8 @@
       const a = document.createElement('a'); a.href=url; a.download=`3dvr-meet-${Date.now()}.webm`; a.click();
       setTimeout(()=>URL.revokeObjectURL(url), 30000);
     }
+
+    updateTestButton();
 
     // Auto-fill room from hash
     window.addEventListener('DOMContentLoaded',()=>{
