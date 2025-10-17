@@ -95,8 +95,7 @@
     // --- State ---
     const me = { id: uuid(), name: '', room: null, joined:false };
     const peers = new Map(); // id -> {pc?, stream?, videos?, meta?, dialing?, pendingIce?, dc?}
-    const testState = { value:false, actor:null };
-    const pendingAcks = new Map();
+    const testState = { count: 0, actor: null };
 
     function ensurePeerRecord(id){
       let record = peers.get(id);
@@ -115,14 +114,17 @@
     }
 
     function updateTestButton(){
-      const label = testState.value ? `Link test ON${testState.actor ? ` (${testState.actor})` : ''}` : 'Test Link';
+      const label = testState.count
+        ? `Test Clicks: ${testState.count}${testState.actor ? ` (last: ${testState.actor})` : ''}`
+        : 'Test Link';
       el.test.textContent = label;
-      el.test.classList.toggle('on', !!testState.value);
-      el.test.setAttribute('aria-pressed', String(!!testState.value));
+      el.test.classList.toggle('on', testState.count > 0);
+      el.test.setAttribute('aria-pressed', 'false');
     }
 
-    function setTestState(value, actor){
-      testState.value = value;
+    function setTestState(count, actor){
+      const nextCount = (typeof count === 'number' && Number.isFinite(count)) ? count : Number(count) || 0;
+      testState.count = Math.max(0, Math.floor(nextCount));
       testState.actor = actor || null;
       updateTestButton();
     }
@@ -145,28 +147,26 @@
         console.warn('Invalid data message', err);
         return;
       }
-      if(msg.type === 'test-toggle'){
+      if(msg.type === 'test-click'){
         const actor = msg.name || peers.get(peerId)?.meta?.name || peerId;
-        setTestState(!!msg.value, actor);
-        status(`Test toggled ${msg.value ? 'on' : 'off'} by ${actor}`);
-        const record = peers.get(peerId);
-        if(record?.dc && record.dc.readyState === 'open' && msg.id){
-          record.dc.send(JSON.stringify({
-            type: 'test-ack', id: msg.id, value: !!msg.value,
-            from: me.id, name: me.name
-          }));
+        const reported = typeof msg.count === 'number' ? Math.max(0, Math.floor(msg.count)) : null;
+        const next = reported !== null ? Math.max(testState.count, reported) : testState.count + 1;
+        if(next !== testState.count){
+          setTestState(next, actor);
+        } else {
+          testState.actor = actor;
+          updateTestButton();
         }
-      } else if(msg.type === 'test-ack'){
-        if(msg.id && pendingAcks.has(msg.id)){
-          const timer = pendingAcks.get(msg.id);
-          clearTimeout(timer);
-          pendingAcks.delete(msg.id);
-          const actor = msg.name || peers.get(peerId)?.meta?.name || peerId;
-          status(`Ack from ${actor}`);
-        }
+        status(`Received test click #${next} from ${actor}`);
       } else if(msg.type === 'test-sync'){
-        const actor = msg.name || peers.get(peerId)?.meta?.name || peerId;
-        setTestState(!!msg.value, actor);
+        if(typeof msg.count === 'number'){
+          const actor = msg.name || peers.get(peerId)?.meta?.name || peerId;
+          const next = Math.max(testState.count, Math.floor(msg.count));
+          if(next !== testState.count){
+            setTestState(next, actor);
+            status(`Synced test clicks to #${next} via ${actor}`);
+          }
+        }
       }
     }
 
@@ -178,7 +178,7 @@
         status(`Data channel open with ${record.meta?.name || peerId}`);
         try {
           channel.send(JSON.stringify({
-            type: 'test-sync', value: testState.value,
+            type: 'test-sync', count: testState.count,
             from: me.id, name: me.name
           }));
         } catch(err){ console.warn('Sync send failed', err); }
@@ -402,9 +402,7 @@
       if(me.room) roomNode(me.room).get('members').get(me.id).put(null);
       el.join.disabled = false; el.leave.disabled = true;
       el.test.disabled = true;
-      for(const [,timer] of pendingAcks){ clearTimeout(timer); }
-      pendingAcks.clear();
-      setTestState(false, null);
+      setTestState(0, null);
       status('Left room.');
     }
 
@@ -446,18 +444,10 @@
 
     el.test.onclick = ()=>{
       if(el.test.disabled) return;
-      const next = !testState.value;
+      const next = testState.count + 1;
       setTestState(next, 'You');
-      const id = uuid();
-      const timer = setTimeout(()=>{
-        if(pendingAcks.has(id)){
-          pendingAcks.delete(id);
-          status('No acknowledgement yet.');
-        }
-      }, 5000);
-      pendingAcks.set(id, timer);
-      broadcastData({ type: 'test-toggle', value: next, id, from: me.id, name: me.name });
-      status(`Sent test ${next ? 'on' : 'off'} toggle…`);
+      broadcastData({ type: 'test-click', count: next, from: me.id, name: me.name });
+      status(`Sent test click #${next}…`);
     };
 
     // --- Recording (client-side) ---
