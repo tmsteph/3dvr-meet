@@ -94,8 +94,12 @@
 
     // --- State ---
     const me = { id: uuid(), name: '', room: null, joined:false };
-    const peers = new Map(); // id -> {pc?, stream?, videos?, meta?, dialing?, pendingIce?, dc?}
-    const testState = { count: 0, actor: null };
+    const peers = new Map(); // id -> {pc?, stream?, videos?, meta?, dialing?, pendingIce?}
+    const testState = { count: 0, actorName: null, actorId: null };
+    const testClicks = new Map();
+    let testWatcher = null;
+    let testInitTimer = null;
+    let testInitializing = false;
 
     function ensurePeerRecord(id){
       let record = peers.get(id);
@@ -114,80 +118,85 @@
     }
 
     function updateTestButton(){
-      const label = testState.count
-        ? `Test Clicks: ${testState.count}${testState.actor ? ` (last: ${testState.actor})` : ''}`
-        : 'Test Link';
-      el.test.textContent = label;
-      el.test.classList.toggle('on', testState.count > 0);
-      el.test.setAttribute('aria-pressed', 'false');
+      const hasCount = testState.count > 0;
+      const base = hasCount ? `Test Clicks: ${testState.count}` : 'Test Link';
+      let suffix = '';
+      if(hasCount && testState.actorName){
+        const actorLabel = testState.actorId === me.id ? 'You' : testState.actorName;
+        suffix = ` (last: ${actorLabel})`;
+      }
+      el.test.textContent = base + suffix;
+      el.test.classList.toggle('on', hasCount);
+      el.test.setAttribute('aria-pressed', hasCount ? 'true' : 'false');
     }
 
-    function setTestState(count, actor){
+    function setTestState(count, actorName, actorId){
       const nextCount = (typeof count === 'number' && Number.isFinite(count)) ? count : Number(count) || 0;
       testState.count = Math.max(0, Math.floor(nextCount));
-      testState.actor = actor || null;
+      testState.actorName = actorName || null;
+      testState.actorId = actorId || null;
       updateTestButton();
     }
 
-    function broadcastData(payload){
-      const message = JSON.stringify(payload);
-      for(const [, entry] of peers){
-        const dc = entry.dc;
-        if(dc && dc.readyState === 'open'){
-          try { dc.send(message); } catch(err){ console.warn('Data send failed', err); }
-        }
-      }
-    }
-
-    function handleDataMessage(peerId, raw){
-      let msg;
-      try {
-        msg = JSON.parse(raw);
-      } catch(err){
-        console.warn('Invalid data message', err);
+    function recomputeTestState(){
+      const entries = [...testClicks.values()].filter(Boolean);
+      if(!entries.length){
+        setTestState(0, null, null);
         return;
       }
-      if(msg.type === 'test-click'){
-        const actor = msg.name || peers.get(peerId)?.meta?.name || peerId;
-        const reported = typeof msg.count === 'number' ? Math.max(0, Math.floor(msg.count)) : null;
-        const next = reported !== null ? Math.max(testState.count, reported) : testState.count + 1;
-        if(next !== testState.count){
-          setTestState(next, actor);
-        } else {
-          testState.actor = actor;
-          updateTestButton();
-        }
-        status(`Received test click #${next} from ${actor}`);
-      } else if(msg.type === 'test-sync'){
-        if(typeof msg.count === 'number'){
-          const actor = msg.name || peers.get(peerId)?.meta?.name || peerId;
-          const next = Math.max(testState.count, Math.floor(msg.count));
-          if(next !== testState.count){
-            setTestState(next, actor);
-            status(`Synced test clicks to #${next} via ${actor}`);
-          }
+      let latest = null;
+      for(const item of entries){
+        const when = (typeof item.at === 'number' && Number.isFinite(item.at)) ? item.at : Number(item.at) || 0;
+        if(!latest || when >= latest.when){
+          latest = {
+            when,
+            name: (item.name && String(item.name).trim()) || item.by || null,
+            id: item.by || null
+          };
         }
       }
+      setTestState(entries.length, latest?.name || null, latest?.id || null);
     }
 
-    function setupDataChannel(peerId, channel){
-      const record = ensurePeerRecord(peerId);
-      record.dc = channel;
-      channel.onmessage = (event)=> handleDataMessage(peerId, event.data);
-      channel.onopen = ()=>{
-        status(`Data channel open with ${record.meta?.name || peerId}`);
-        try {
-          channel.send(JSON.stringify({
-            type: 'test-sync', count: testState.count,
-            from: me.id, name: me.name
-          }));
-        } catch(err){ console.warn('Sync send failed', err); }
-      };
-      channel.onclose = ()=>{
-        if(record.dc === channel){ delete record.dc; }
-      };
-      channel.onerror = (err)=> console.warn('Data channel error', err);
+    function subscribeTestClicks(roomId){
+      if(testWatcher && typeof testWatcher.off === 'function'){ testWatcher.off(); }
+      testWatcher = null;
+      if(testInitTimer){ clearTimeout(testInitTimer); testInitTimer = null; }
+      testInitializing = true;
+      testInitTimer = setTimeout(()=>{
+        testInitializing = false;
+        testInitTimer = null;
+        if(testState.count > 0){
+          const via = testState.actorId === me.id ? 'You' : (testState.actorName || 'another participant');
+          status(`Synced test clicks to #${testState.count} via ${via}`);
+        }
+      }, 400);
+      testClicks.clear();
+      recomputeTestState();
+
+      const chain = roomNode(roomId).get('testClicks').map();
+      chain.on((val, key)=>{
+        if(key === '_' || key == null) return;
+        const known = testClicks.has(key);
+        if(!val){
+          if(known){ testClicks.delete(key); recomputeTestState(); }
+          return;
+        }
+        if(typeof val === 'object'){
+          const prevCount = testState.count;
+          testClicks.set(key, val);
+          recomputeTestState();
+          if(!testInitializing && !known){
+            const actorName = (val.name && String(val.name).trim()) || val.by || key;
+            if(val.by !== me.id && testState.count >= prevCount){
+              status(`Received test click #${testState.count} from ${actorName}`);
+            }
+          }
+        }
+      });
+      testWatcher = chain;
     }
+
     let localStream = null;
     let screenStream = null;
 
@@ -267,22 +276,14 @@
           });
         }
       };
-      pc.ondatachannel = (event)=>{
-        setupDataChannel(remoteId, event.channel);
-      };
       pc.onconnectionstatechange = ()=>{
         status(`Peer ${remoteId}: ${pc.connectionState}`);
         if(['failed','disconnected','closed'].includes(pc.connectionState)){
           const entry = peers.get(remoteId);
           if(entry?.stream){ entry.stream.getTracks().forEach(t=>t.stop()); }
-          if(entry?.dc && entry.dc.readyState !== 'closed'){ try { entry.dc.close(); } catch{} }
           removeVideoTile(remoteId);
           peers.delete(remoteId);
         }
-      }
-      if(me.id < peerId && !record.dc){
-        const channel = pc.createDataChannel('control', { ordered: true });
-        setupDataChannel(peerId, channel);
       }
       return pc;
     }
@@ -297,7 +298,6 @@
         if(!val){
           const existing = peers.get(id);
           if(existing?.stream){ existing.stream.getTracks().forEach(t=>t.stop()); }
-          if(existing?.dc && existing.dc.readyState !== 'closed'){ try { existing.dc.close(); } catch{} }
           if(existing?.videos) removeVideoTile(id);
           peers.delete(id);
           return;
@@ -379,6 +379,7 @@
       await getUserMediaIfNeeded();
       me.joined = true;
       startSignaling();
+      subscribeTestClicks(room);
       // Advertise ourselves
       roomNode(room).get('members').get(me.id).put({ name: me.name, at: Date.now() });
       status(`Joined room: ${room} as ${me.name}`);
@@ -400,9 +401,14 @@
       if(screenStream){ screenStream.getTracks().forEach(t=>t.stop()); screenStream=null; }
       // Remove from room
       if(me.room) roomNode(me.room).get('members').get(me.id).put(null);
+      me.room = null;
       el.join.disabled = false; el.leave.disabled = true;
       el.test.disabled = true;
-      setTestState(0, null);
+      if(testWatcher && typeof testWatcher.off === 'function'){ testWatcher.off(); }
+      testWatcher = null;
+      if(testInitTimer){ clearTimeout(testInitTimer); testInitTimer = null; }
+      testClicks.clear();
+      setTestState(0, null, null);
       status('Left room.');
     }
 
@@ -443,11 +449,19 @@
     };
 
     el.test.onclick = ()=>{
-      if(el.test.disabled) return;
-      const next = testState.count + 1;
-      setTestState(next, 'You');
-      broadcastData({ type: 'test-click', count: next, from: me.id, name: me.name });
-      status(`Sent test click #${next}…`);
+      if(el.test.disabled || !me.joined || !me.room) return;
+      const clickId = `${me.id}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`;
+      const payload = {
+        by: me.id,
+        name: me.name,
+        at: Date.now()
+      };
+      testClicks.set(clickId, payload);
+      const prevCount = testState.count;
+      recomputeTestState();
+      const label = testState.count > prevCount ? `#${testState.count}` : '';
+      status(`Logged test click ${label}`.trim());
+      roomNode(me.room).get('testClicks').get(clickId).put(payload);
     };
 
     // --- Recording (client-side) ---
