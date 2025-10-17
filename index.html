@@ -101,7 +101,9 @@
     let audioCtx, mixDest, mediaRecorder, chunks = [];
 
     // --- Gun setup (signaling only) ---
-    const gun = Gun({ peers: [/* add your peers if you run relays; public works too */] });
+    const gun = Gun({ peers: [
+      'https://3dvr-relay.fly.dev/gun'
+    ] });
 
     function roomNode(room){ return gun.get('3dvr-meet').get(room); }
 
