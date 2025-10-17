@@ -96,7 +96,7 @@
     const me = { id: uuid(), name: '', room: null, joined:false };
     const peers = new Map(); // id -> {pc?, stream?, videos?, meta?, dialing?, pendingIce?}
     const testState = { count: 0, actorName: null, actorId: null };
-    const testClicks = new Map();
+    const testClicks = new Map(); // peerId -> { count, name, by, at }
     let testWatcher = null;
     let testInitTimer = null;
     let testInitializing = false;
@@ -144,8 +144,11 @@
         setTestState(0, null, null);
         return;
       }
+      let total = 0;
       let latest = null;
       for(const item of entries){
+        const amount = (typeof item.count === 'number' && Number.isFinite(item.count)) ? item.count : Number(item.count) || 0;
+        total += Math.max(0, Math.floor(amount));
         const when = (typeof item.at === 'number' && Number.isFinite(item.at)) ? item.at : Number(item.at) || 0;
         if(!latest || when >= latest.when){
           latest = {
@@ -155,7 +158,7 @@
           };
         }
       }
-      setTestState(entries.length, latest?.name || null, latest?.id || null);
+      setTestState(total, latest?.name || null, latest?.id || null);
     }
 
     function subscribeTestClicks(roomId){
@@ -179,18 +182,19 @@
         if(key === '_' || key == null) return;
         const known = testClicks.has(key);
         if(!val){
-          if(known){ testClicks.delete(key); recomputeTestState(); }
+          if(known){
+            testClicks.delete(key);
+            recomputeTestState();
+          }
           return;
         }
         if(typeof val === 'object'){
-          const prevCount = testState.count;
+          const prevTotal = testState.count;
           testClicks.set(key, val);
           recomputeTestState();
-          if(!testInitializing && !known){
+          if(!testInitializing && key !== me.id && testState.count > prevTotal){
             const actorName = (val.name && String(val.name).trim()) || val.by || key;
-            if(val.by !== me.id && testState.count >= prevCount){
-              status(`Received test click #${testState.count} from ${actorName}`);
-            }
+            status(`Received test click #${testState.count} from ${actorName}`);
           }
         }
       });
@@ -400,7 +404,10 @@
       // Stop screen
       if(screenStream){ screenStream.getTracks().forEach(t=>t.stop()); screenStream=null; }
       // Remove from room
-      if(me.room) roomNode(me.room).get('members').get(me.id).put(null);
+      if(me.room){
+        roomNode(me.room).get('members').get(me.id).put(null);
+        roomNode(me.room).get('testClicks').get(me.id).put(null);
+      }
       me.room = null;
       el.join.disabled = false; el.leave.disabled = true;
       el.test.disabled = true;
@@ -450,18 +457,20 @@
 
     el.test.onclick = ()=>{
       if(el.test.disabled || !me.joined || !me.room) return;
-      const clickId = `${me.id}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`;
+      const current = testClicks.get(me.id);
+      const nextCount = (current?.count || 0) + 1;
       const payload = {
         by: me.id,
         name: me.name,
+        count: nextCount,
         at: Date.now()
       };
-      testClicks.set(clickId, payload);
-      const prevCount = testState.count;
+      testClicks.set(me.id, payload);
+      const prevTotal = testState.count;
       recomputeTestState();
-      const label = testState.count > prevCount ? `#${testState.count}` : '';
+      const label = testState.count > prevTotal ? `#${testState.count}` : '';
       status(`Logged test click ${label}`.trim());
-      roomNode(me.room).get('testClicks').get(clickId).put(payload);
+      roomNode(me.room).get('testClicks').get(me.id).put(payload);
     };
 
     // --- Recording (client-side) ---
