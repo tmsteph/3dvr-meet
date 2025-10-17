@@ -220,13 +220,14 @@
 
     // --- Join / Leave ---
     async function join(){
+      if(me.joined){ status(`Already in room: ${me.room}`); return; }
       const room = (el.room.value || location.hash.slice(1) || 'demo').trim();
       me.room = room; me.name = el.name.value.trim() || `guest-${me.id}`;
       await getUserMediaIfNeeded();
+      me.joined = true;
       startSignaling();
       // Advertise ourselves
       roomNode(room).get('members').get(me.id).put({ name: me.name, at: Date.now() });
-      me.joined = true;
       status(`Joined room: ${room} as ${me.name}`);
       el.join.disabled = true; el.leave.disabled = false;
       history.replaceState(null, '', `#${encodeURIComponent(room)}`);
