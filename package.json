@@ -1,0 +1,11 @@
+{
+  "name": "3dvr-meet",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "relay": "node scripts/dev-relay.js"
+  },
+  "dependencies": {
+    "gun": "^0.2020.1241"
+  }
+}

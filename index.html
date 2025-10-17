@@ -49,6 +49,7 @@
       <div class="controls">
         <input id="displayName" placeholder="Your name (optional)" />
         <input id="room" placeholder="Room ID (e.g. demo)" />
+        <input id="relays" class="span-3" placeholder="Relays (comma separated URLs)" />
         <button id="joinBtn" class="good">Join</button>
         <button id="leaveBtn" class="danger" disabled>Leave</button>
         <button id="toggleCam" disabled>Cam</button>
@@ -73,17 +74,144 @@
     <span class="hint">Peer-to-peer via WebRTC. Signaling via Gun.js. Recording is client-side only.</span>
   </footer>
 
-  <!-- Gun.js (CDN) -->
-  <script src="https://cdn.jsdelivr.net/npm/gun/gun.js"></script>
+  <!-- Gun.js (local copy) -->
+  <script src="vendor/gun.js"></script>
   <script>
     // --- Utility ---
     const $ = (sel) => document.querySelector(sel);
-    const status = (t) => { document.getElementById('status').textContent = t }
+    const statusEl = document.getElementById('status');
+    const statusState = { primary: 'Idle.', relay: '' };
+
+    function renderStatus(){
+      const parts = [];
+      if(statusState.primary){ parts.push(statusState.primary); }
+      if(statusState.relay){ parts.push(statusState.relay); }
+      statusEl.textContent = parts.join(' — ') || '';
+    }
+
+    function status(message){
+      statusState.primary = message || '';
+      renderStatus();
+    }
+
+    function setRelayStatus(message){
+      const next = message || '';
+      if(statusState.relay === next) return;
+      statusState.relay = next;
+      renderStatus();
+    }
+
+    renderStatus();
+
+    const RELAY_STORAGE_KEY = '3dvr.relays';
+
+    function normalizeRelayUrl(value){
+      if(!value) return null;
+      let text = String(value).trim();
+      if(!text) return null;
+      try {
+        if(!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(text)){
+          const scheme = location.protocol === 'https:' ? 'https://' : 'http://';
+          text = scheme + text.replace(/^\/+/, '');
+        }
+        const url = new URL(text, location.origin);
+        if(!url.pathname.endsWith('/gun')){
+          url.pathname = url.pathname.replace(/\/+$/, '') + '/gun';
+        }
+        if(url.protocol === 'http:' && location.protocol === 'https:'){
+          url.protocol = 'https:';
+        }
+        if(url.protocol === 'ws:' && location.protocol === 'https:'){
+          url.protocol = 'wss:';
+        }
+        url.hash = '';
+        url.search = '';
+        return url.toString();
+      } catch(err){
+        console.warn('Invalid relay url', value, err);
+        return null;
+      }
+    }
+
+    function uniqueList(list){
+      const seen = new Set();
+      const out = [];
+      for(const item of list){
+        if(!item || seen.has(item)) continue;
+        seen.add(item);
+        out.push(item);
+      }
+      return out;
+    }
+
+    function loadStoredRelays(){
+      try {
+        const raw = localStorage.getItem(RELAY_STORAGE_KEY);
+        if(!raw) return [];
+        const parsed = JSON.parse(raw);
+        if(Array.isArray(parsed)){
+          return uniqueList(parsed.map(normalizeRelayUrl).filter(Boolean));
+        }
+      } catch(err){
+        console.warn('Failed to load relay preferences', err);
+      }
+      return [];
+    }
+
+    function persistRelays(list){
+      try {
+        if(list?.length){
+          localStorage.setItem(RELAY_STORAGE_KEY, JSON.stringify(list));
+        } else {
+          localStorage.removeItem(RELAY_STORAGE_KEY);
+        }
+      } catch(err){
+        console.warn('Unable to persist relay preferences', err);
+      }
+    }
+
+    function parseRelayInput(str){
+      if(!str) return [];
+      return uniqueList(str.split(/[\s,]+/).map(normalizeRelayUrl).filter(Boolean));
+    }
+
+    function computeLocalRelay(){
+      if(location.protocol === 'https:') return null;
+      const host = location.hostname || '';
+      if(host === 'localhost' || host.startsWith('127.') || host === '0.0.0.0'){
+        return `http://${host}:8765/gun`;
+      }
+      return null;
+    }
+
+    const DEFAULT_GUN_RELAYS = [
+      'https://3dvr-relay.fly.dev/gun',
+      'https://gun.eco/gun',
+      'https://gun-us.herokuapp.com/gun',
+      'https://gun-eu.herokuapp.com/gun',
+      'https://gunjs.herokuapp.com/gun',
+      'https://gun-manhattan.herokuapp.com/gun'
+    ];
+
+    const normalizedDefaultRelays = uniqueList(DEFAULT_GUN_RELAYS.map(normalizeRelayUrl).filter(Boolean));
+    const localRelayUrl = computeLocalRelay();
+    let customRelayList = loadStoredRelays();
+
+    function computeActivePeers(customList){
+      const base = (customList && customList.length) ? customList : normalizedDefaultRelays;
+      const all = [];
+      if(localRelayUrl) all.push(localRelayUrl);
+      all.push(...base);
+      return uniqueList(all);
+    }
+
+    let activeGunPeers = computeActivePeers(customRelayList);
+
     const uuid = () => crypto.randomUUID().slice(0,8);
 
     // --- Elements ---
     const el = {
-      name: $('#displayName'), room: $('#room'),
+      name: $('#displayName'), room: $('#room'), relays: $('#relays'),
       join: $('#joinBtn'), leave: $('#leaveBtn'),
       cam: $('#toggleCam'), mic: $('#toggleMic'),
       screen: $('#shareScreen'),
@@ -91,6 +219,24 @@
       test: $('#testLink'),
       videos: $('#videos')
     };
+
+    if(el.relays){
+      if(customRelayList.length){
+        el.relays.value = customRelayList.join(', ');
+      }
+      el.relays.addEventListener('change', ()=>{
+        const parsed = parseRelayInput(el.relays.value);
+        customRelayList = parsed;
+        persistRelays(parsed);
+        applyActivePeers(computeActivePeers(parsed));
+        if(parsed.length){
+          const plural = parsed.length === 1 ? '' : 's';
+          status(`Saved ${parsed.length} custom relay${plural}.`);
+        } else {
+          status('Cleared custom relay preferences. Using defaults.');
+        }
+      });
+    }
 
     // --- State ---
     const me = { id: uuid(), name: '', room: null, joined:false };
@@ -209,9 +355,72 @@
     let audioCtx, mixDest, mediaRecorder, chunks = [];
 
     // --- Gun setup (signaling only) ---
-    const gun = Gun({ peers: [
-      'https://3dvr-relay.fly.dev/gun'
-    ] });
+    const GUN_PEERS = [
+      'https://3dvr-relay.fly.dev/gun',
+      'https://gun.eco/gun',
+      'https://gun-us.herokuapp.com/gun',
+      'https://gun-eu.herokuapp.com/gun',
+      'https://gunjs.herokuapp.com/gun',
+      'https://gun-manhattan.herokuapp.com/gun'
+    ];
+
+    const gun = Gun({
+      peers: activeGunPeers,
+      localStorage: false,
+      radisk: false,
+      retry: 2000
+    });
+
+    const connectedRelays = new Map();
+    let sawRelayConnection = false;
+
+    function relayHost(url){
+      try { return new URL(url).host; }
+      catch { return url; }
+    }
+
+    function describeRelayStatus(){
+      if(connectedRelays.size){
+        sawRelayConnection = true;
+        const hosts = [...connectedRelays.values()];
+        const listed = hosts.slice(0, 2).join(', ');
+        const suffix = hosts.length > 2 ? '…' : '';
+        const label = hosts.length === 1 ? 'relay' : 'relays';
+        setRelayStatus(`Connected to signaling ${label}: ${listed}${suffix}`);
+      } else {
+        const msg = sawRelayConnection ? 'Reconnecting to signaling relays…' : 'Connecting to signaling relays…';
+        setRelayStatus(msg);
+      }
+    }
+
+    describeRelayStatus();
+
+    function applyActivePeers(peers){
+      activeGunPeers = uniqueList(peers);
+      const peerMap = {};
+      for(const url of activeGunPeers){
+        peerMap[url] = { url };
+      }
+      gun.opt({ peers: peerMap });
+      for(const url of [...connectedRelays.keys()]){
+        if(!peerMap[url]) connectedRelays.delete(url);
+      }
+      describeRelayStatus();
+    }
+
+    gun.on('hi', (peer)=>{
+      if(peer?.url){
+        connectedRelays.set(peer.url, relayHost(peer.url));
+        describeRelayStatus();
+      }
+    });
+
+    gun.on('bye', (peer)=>{
+      if(peer?.url){
+        connectedRelays.delete(peer.url);
+        describeRelayStatus();
+      }
+    });
 
     function roomNode(room){ return gun.get('3dvr-meet').get(room); }
 
@@ -275,8 +484,9 @@
 
       pc.onicecandidate = (e)=>{
         if(e.candidate){
+          const payload = (typeof e.candidate.toJSON === 'function') ? e.candidate.toJSON() : e.candidate;
           roomNode(me.room).get('signals').get(remoteId).set({
-            from: me.id, type: 'ice', candidate: e.candidate
+            from: me.id, type: 'ice', candidate: payload
           });
         }
       };
