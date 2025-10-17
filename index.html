@@ -49,11 +49,13 @@
       <div class="controls">
         <input id="displayName" placeholder="Your name (optional)" />
         <input id="room" placeholder="Room ID (e.g. demo)" />
+        <input id="relays" class="span-3" placeholder="Relays (comma separated URLs)" />
         <button id="joinBtn" class="good">Join</button>
         <button id="leaveBtn" class="danger" disabled>Leave</button>
         <button id="toggleCam" disabled>Cam</button>
         <button id="toggleMic" disabled>Mic</button>
         <button id="shareScreen" disabled>Share Screen</button>
+        <button id="testLink" disabled>Test Link</button>
         <button id="recStart" class="warn" disabled>Start Rec</button>
         <button id="recStop" class="danger" disabled>Stop Rec</button>
         <button id="downloadBtn" disabled>Download</button>
@@ -72,27 +74,298 @@
     <span class="hint">Peer-to-peer via WebRTC. Signaling via Gun.js. Recording is client-side only.</span>
   </footer>
 
-  <!-- Gun.js (CDN) -->
-  <script src="https://cdn.jsdelivr.net/npm/gun/gun.js"></script>
+  <!-- Gun.js (local copy) -->
+  <script src="vendor/gun.js"></script>
   <script>
     // --- Utility ---
     const $ = (sel) => document.querySelector(sel);
-    const status = (t) => { document.getElementById('status').textContent = t }
+    const statusEl = document.getElementById('status');
+    const statusState = { primary: 'Idle.', relay: '' };
+
+    function renderStatus(){
+      const parts = [];
+      if(statusState.primary){ parts.push(statusState.primary); }
+      if(statusState.relay){ parts.push(statusState.relay); }
+      statusEl.textContent = parts.join(' — ') || '';
+    }
+
+    function status(message){
+      statusState.primary = message || '';
+      renderStatus();
+    }
+
+    function setRelayStatus(message){
+      const next = message || '';
+      if(statusState.relay === next) return;
+      statusState.relay = next;
+      renderStatus();
+    }
+
+    renderStatus();
+
+    const RELAY_STORAGE_KEY = '3dvr.relays';
+
+    function normalizeRelayUrl(value){
+      if(!value) return null;
+      let text = String(value).trim();
+      if(!text) return null;
+      try {
+        if(!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(text)){
+          const scheme = location.protocol === 'https:' ? 'https://' : 'http://';
+          text = scheme + text.replace(/^\/+/, '');
+        }
+        const url = new URL(text, location.origin);
+        if(!url.pathname.endsWith('/gun')){
+          url.pathname = url.pathname.replace(/\/+$/, '') + '/gun';
+        }
+        if(url.protocol === 'http:' && location.protocol === 'https:'){
+          url.protocol = 'https:';
+        }
+        if(url.protocol === 'ws:' && location.protocol === 'https:'){
+          url.protocol = 'wss:';
+        }
+        url.hash = '';
+        url.search = '';
+        return url.toString();
+      } catch(err){
+        console.warn('Invalid relay url', value, err);
+        return null;
+      }
+    }
+
+    function uniqueList(list){
+      const seen = new Set();
+      const out = [];
+      for(const item of list){
+        if(!item || seen.has(item)) continue;
+        seen.add(item);
+        out.push(item);
+      }
+      return out;
+    }
+
+    function listsEqual(a, b){
+      if(a === b) return true;
+      if(!Array.isArray(a) || !Array.isArray(b)) return false;
+      if(a.length !== b.length) return false;
+      for(let i=0;i<a.length;i++){
+        if(a[i] !== b[i]) return false;
+      }
+      return true;
+    }
+
+    function loadStoredRelays(){
+      try {
+        const raw = localStorage.getItem(RELAY_STORAGE_KEY);
+        if(!raw) return [];
+        const parsed = JSON.parse(raw);
+        if(Array.isArray(parsed)){
+          return uniqueList(parsed.map(normalizeRelayUrl).filter(Boolean));
+        }
+      } catch(err){
+        console.warn('Failed to load relay preferences', err);
+      }
+      return [];
+    }
+
+    function persistRelays(list){
+      try {
+        if(list?.length){
+          localStorage.setItem(RELAY_STORAGE_KEY, JSON.stringify(list));
+        } else {
+          localStorage.removeItem(RELAY_STORAGE_KEY);
+        }
+      } catch(err){
+        console.warn('Unable to persist relay preferences', err);
+      }
+    }
+
+    function parseRelayInput(str){
+      if(!str) return [];
+      return uniqueList(str.split(/[\s,]+/).map(normalizeRelayUrl).filter(Boolean));
+    }
+
+    function computeLocalRelay(){
+      if(location.protocol === 'https:') return null;
+      const host = location.hostname || '';
+      if(host === 'localhost' || host.startsWith('127.') || host === '0.0.0.0'){
+        return `http://${host}:8765/gun`;
+      }
+      return null;
+    }
+
+    const DEFAULT_GUN_RELAYS = [
+      'https://3dvr-relay.fly.dev/gun'
+    ];
+
+    const normalizedDefaultRelays = uniqueList(DEFAULT_GUN_RELAYS.map(normalizeRelayUrl).filter(Boolean));
+    const localRelayUrl = computeLocalRelay();
+    let customRelayList = loadStoredRelays();
+
+    function computeActivePeers(customList){
+      const base = (customList && customList.length) ? customList : normalizedDefaultRelays;
+      const all = [];
+      if(localRelayUrl) all.push(localRelayUrl);
+      all.push(...base);
+      return uniqueList(all);
+    }
+
+    let activeGunPeers = computeActivePeers(customRelayList);
+
     const uuid = () => crypto.randomUUID().slice(0,8);
 
     // --- Elements ---
     const el = {
-      name: $('#displayName'), room: $('#room'),
+      name: $('#displayName'), room: $('#room'), relays: $('#relays'),
       join: $('#joinBtn'), leave: $('#leaveBtn'),
       cam: $('#toggleCam'), mic: $('#toggleMic'),
       screen: $('#shareScreen'),
       recStart: $('#recStart'), recStop: $('#recStop'), dl: $('#downloadBtn'),
+      test: $('#testLink'),
       videos: $('#videos')
     };
 
+    function setCustomRelays(list, { announce = true } = {}){
+      const normalized = uniqueList((list || []).map(normalizeRelayUrl).filter(Boolean));
+      if(listsEqual(normalized, customRelayList)){
+        return normalized;
+      }
+      customRelayList = normalized;
+      persistRelays(normalized);
+      applyActivePeers(computeActivePeers(normalized));
+      if(announce){
+        if(normalized.length){
+          const plural = normalized.length === 1 ? '' : 's';
+          status(`Using ${normalized.length} custom relay${plural}.`);
+        } else {
+          status('Cleared custom relay preferences. Using default relay.');
+        }
+      }
+      return normalized;
+    }
+
+    if(el.relays){
+      if(customRelayList.length){
+        el.relays.value = customRelayList.join(', ');
+      } else if(normalizedDefaultRelays.length){
+        el.relays.placeholder = normalizedDefaultRelays.join(', ');
+      }
+      const relayInputHandler = ()=>{
+        setCustomRelays(parseRelayInput(el.relays.value));
+      };
+      el.relays.addEventListener('change', relayInputHandler);
+      el.relays.addEventListener('blur', relayInputHandler);
+    }
+
     // --- State ---
     const me = { id: uuid(), name: '', room: null, joined:false };
-    const peers = new Map(); // id -> {pc, stream, videos: {tile, el}}
+    const peers = new Map(); // id -> {pc?, stream?, videos?, meta?, dialing?, pendingIce?}
+    const testState = { count: 0, actorName: null, actorId: null };
+    const testClicks = new Map(); // peerId -> { count, name, by, at }
+    let testWatcher = null;
+    let testInitTimer = null;
+    let testInitializing = false;
+
+    function ensurePeerRecord(id){
+      let record = peers.get(id);
+      if(!record){
+        record = {};
+        peers.set(id, record);
+      }
+      return record;
+    }
+
+    function updatePeerTileLabel(id){
+      const record = peers.get(id);
+      if(record?.videos){
+        record.videos.label.textContent = (record.meta?.name) || id;
+      }
+    }
+
+    function updateTestButton(){
+      const hasCount = testState.count > 0;
+      const base = hasCount ? `Test Clicks: ${testState.count}` : 'Test Link';
+      let suffix = '';
+      if(hasCount && testState.actorName){
+        const actorLabel = testState.actorId === me.id ? 'You' : testState.actorName;
+        suffix = ` (last: ${actorLabel})`;
+      }
+      el.test.textContent = base + suffix;
+      el.test.classList.toggle('on', hasCount);
+      el.test.setAttribute('aria-pressed', hasCount ? 'true' : 'false');
+    }
+
+    function setTestState(count, actorName, actorId){
+      const nextCount = (typeof count === 'number' && Number.isFinite(count)) ? count : Number(count) || 0;
+      testState.count = Math.max(0, Math.floor(nextCount));
+      testState.actorName = actorName || null;
+      testState.actorId = actorId || null;
+      updateTestButton();
+    }
+
+    function recomputeTestState(){
+      const entries = [...testClicks.values()].filter(Boolean);
+      if(!entries.length){
+        setTestState(0, null, null);
+        return;
+      }
+      let total = 0;
+      let latest = null;
+      for(const item of entries){
+        const amount = (typeof item.count === 'number' && Number.isFinite(item.count)) ? item.count : Number(item.count) || 0;
+        total += Math.max(0, Math.floor(amount));
+        const when = (typeof item.at === 'number' && Number.isFinite(item.at)) ? item.at : Number(item.at) || 0;
+        if(!latest || when >= latest.when){
+          latest = {
+            when,
+            name: (item.name && String(item.name).trim()) || item.by || null,
+            id: item.by || null
+          };
+        }
+      }
+      setTestState(total, latest?.name || null, latest?.id || null);
+    }
+
+    function subscribeTestClicks(roomId){
+      if(testWatcher && typeof testWatcher.off === 'function'){ testWatcher.off(); }
+      testWatcher = null;
+      if(testInitTimer){ clearTimeout(testInitTimer); testInitTimer = null; }
+      testInitializing = true;
+      testInitTimer = setTimeout(()=>{
+        testInitializing = false;
+        testInitTimer = null;
+        if(testState.count > 0){
+          const via = testState.actorId === me.id ? 'You' : (testState.actorName || 'another participant');
+          status(`Synced test clicks to #${testState.count} via ${via}`);
+        }
+      }, 400);
+      testClicks.clear();
+      recomputeTestState();
+
+      const chain = roomNode(roomId).get('testClicks').map();
+      chain.on((val, key)=>{
+        if(key === '_' || key == null) return;
+        const known = testClicks.has(key);
+        if(!val){
+          if(known){
+            testClicks.delete(key);
+            recomputeTestState();
+          }
+          return;
+        }
+        if(typeof val === 'object'){
+          const prevTotal = testState.count;
+          testClicks.set(key, val);
+          recomputeTestState();
+          if(!testInitializing && key !== me.id && testState.count > prevTotal){
+            const actorName = (val.name && String(val.name).trim()) || val.by || key;
+            status(`Received test click #${testState.count} from ${actorName}`);
+          }
+        }
+      });
+      testWatcher = chain;
+    }
+
     let localStream = null;
     let screenStream = null;
 
@@ -101,9 +374,64 @@
     let audioCtx, mixDest, mediaRecorder, chunks = [];
 
     // --- Gun setup (signaling only) ---
-    const gun = Gun({ peers: [
-      'https://3dvr-relay.fly.dev/gun'
-    ] });
+    const gun = Gun({
+      peers: activeGunPeers,
+      localStorage: false,
+      radisk: false,
+      retry: 2000
+    });
+
+    const connectedRelays = new Map();
+    let sawRelayConnection = false;
+
+    function relayHost(url){
+      try { return new URL(url).host; }
+      catch { return url; }
+    }
+
+    function describeRelayStatus(){
+      if(connectedRelays.size){
+        sawRelayConnection = true;
+        const hosts = [...connectedRelays.values()];
+        const listed = hosts.slice(0, 2).join(', ');
+        const suffix = hosts.length > 2 ? '…' : '';
+        const label = hosts.length === 1 ? 'relay' : 'relays';
+        setRelayStatus(`Connected to signaling ${label}: ${listed}${suffix}`);
+      } else {
+        const targetLabel = activeGunPeers.length === 1 ? 'relay' : 'relays';
+        const msg = sawRelayConnection ? `Reconnecting to signaling ${targetLabel}…` : `Connecting to signaling ${targetLabel}…`;
+        setRelayStatus(msg);
+      }
+    }
+
+    describeRelayStatus();
+
+    function applyActivePeers(peers){
+      activeGunPeers = uniqueList(peers);
+      const peerMap = {};
+      for(const url of activeGunPeers){
+        peerMap[url] = { url };
+      }
+      gun.opt({ peers: peerMap });
+      for(const url of [...connectedRelays.keys()]){
+        if(!peerMap[url]) connectedRelays.delete(url);
+      }
+      describeRelayStatus();
+    }
+
+    gun.on('hi', (peer)=>{
+      if(peer?.url){
+        connectedRelays.set(peer.url, relayHost(peer.url));
+        describeRelayStatus();
+      }
+    });
+
+    gun.on('bye', (peer)=>{
+      if(peer?.url){
+        connectedRelays.delete(peer.url);
+        describeRelayStatus();
+      }
+    });
 
     function roomNode(room){ return gun.get('3dvr-meet').get(room); }
 
@@ -114,7 +442,7 @@
       const tag = document.createElement('div'); tag.className='label'; tag.textContent = label || id;
       tile.appendChild(v); tile.appendChild(tag);
       el.videos.appendChild(tile);
-      return { tile, v };
+      return { tile, v, label: tag };
     }
     function removeVideoTile(id){ const t = document.getElementById(`tile-${id}`); if(t) t.remove(); }
 
@@ -137,6 +465,8 @@
 
     async function createPeerConnection(peerId){
       const pc = new RTCPeerConnection(rtcConfig);
+      const record = ensurePeerRecord(peerId);
+      record.pc = pc;
 
       // Add our current tracks
       (localStream?.getTracks() || []).forEach(t => pc.addTrack(t, localStream));
@@ -144,28 +474,38 @@
 
       // Remote tracks
       const remoteId = peerId;
-      let remoteStream = new MediaStream();
       pc.ontrack = (e)=>{
-        e.streams[0].getTracks().forEach(tr=>remoteStream.addTrack(tr));
-        let p = peers.get(remoteId);
-        if(!p){
-          const tile = addVideoTile(remoteId, remoteId);
-          p = { pc, stream: remoteStream, videos: tile };
-          peers.set(remoteId, p);
+        const entry = ensurePeerRecord(remoteId);
+        entry.pc = pc;
+        if(!entry.stream){ entry.stream = new MediaStream(); }
+        const inbound = e.streams?.[0];
+        if(inbound){
+          inbound.getTracks().forEach(tr=>{
+            if(!entry.stream.getTrackById(tr.id)) entry.stream.addTrack(tr);
+          });
+        } else if(e.track && !entry.stream.getTrackById(e.track.id)){
+          entry.stream.addTrack(e.track);
         }
-        p.videos.v.srcObject = remoteStream;
+        if(!entry.videos){
+          entry.videos = addVideoTile(remoteId, entry.meta?.name || remoteId);
+        }
+        entry.videos.v.srcObject = entry.stream;
+        updatePeerTileLabel(remoteId);
       };
 
       pc.onicecandidate = (e)=>{
         if(e.candidate){
+          const payload = (typeof e.candidate.toJSON === 'function') ? e.candidate.toJSON() : e.candidate;
           roomNode(me.room).get('signals').get(remoteId).set({
-            from: me.id, type: 'ice', candidate: e.candidate
+            from: me.id, type: 'ice', candidate: payload
           });
         }
       };
       pc.onconnectionstatechange = ()=>{
         status(`Peer ${remoteId}: ${pc.connectionState}`);
         if(['failed','disconnected','closed'].includes(pc.connectionState)){
+          const entry = peers.get(remoteId);
+          if(entry?.stream){ entry.stream.getTracks().forEach(t=>t.stop()); }
           removeVideoTile(remoteId);
           peers.delete(remoteId);
         }
@@ -179,10 +519,25 @@
 
       // Listen for new members
       room.get('members').map().on((val, id)=>{
-        if(!val) return; if(id===me.id) return; if(!me.joined) return;
+        if(id===me.id) return;
+        if(!val){
+          const existing = peers.get(id);
+          if(existing?.stream){ existing.stream.getTracks().forEach(t=>t.stop()); }
+          if(existing?.videos) removeVideoTile(id);
+          peers.delete(id);
+          return;
+        }
+        const entry = ensurePeerRecord(id);
+        entry.meta = val;
+        updatePeerTileLabel(id);
+        if(!me.joined) return;
         // Initiate connection if we see someone and we have a lower id (simple deterministic rule)
-        if(me.id < id && !peers.get(id)){
-          dial(id).catch(console.error);
+        if(me.id < id && !entry.pc && !entry.dialing){
+          entry.dialing = true;
+          dial(id).catch(err=>{
+            console.error(err);
+            entry.dialing = false;
+          });
         }
       });
 
@@ -191,44 +546,74 @@
         if(!sig) return;
         const { from, type } = sig;
         if(from === me.id) return;
-        let p = peers.get(from);
+        const entry = ensurePeerRecord(from);
         if(type==='offer'){
-          if(!p){
-            const pc = await createPeerConnection(from);
-            peers.set(from, { pc });
-            p = peers.get(from);
+          if(!entry.pc){
+            await createPeerConnection(from);
           }
-          await p.pc.setRemoteDescription(new RTCSessionDescription(sig.sdp));
-          const answer = await p.pc.createAnswer();
-          await p.pc.setLocalDescription(answer);
-          room.get('signals').get(from).set({ from: me.id, type:'answer', sdp: p.pc.localDescription });
+          await entry.pc.setRemoteDescription(new RTCSessionDescription(sig.sdp));
+          const answer = await entry.pc.createAnswer();
+          await entry.pc.setLocalDescription(answer);
+          room.get('signals').get(from).set({ from: me.id, type:'answer', sdp: entry.pc.localDescription });
+          if(entry.pendingIce?.length){
+            for(const candidate of entry.pendingIce){
+              try{ await entry.pc.addIceCandidate(candidate); }catch(e){ console.warn(e); }
+            }
+            entry.pendingIce = [];
+          }
         } else if(type==='answer'){
-          if(p){ await p.pc.setRemoteDescription(new RTCSessionDescription(sig.sdp)); }
+          if(entry.pc){
+            await entry.pc.setRemoteDescription(new RTCSessionDescription(sig.sdp));
+            if(entry.pendingIce?.length){
+              for(const candidate of entry.pendingIce){
+                try{ await entry.pc.addIceCandidate(candidate); }catch(e){ console.warn(e); }
+              }
+              entry.pendingIce = [];
+            }
+          }
         } else if(type==='ice'){
-          if(p && sig.candidate){ try{ await p.pc.addIceCandidate(sig.candidate); }catch(e){console.warn(e)} }
+          if(sig.candidate){
+            if(entry.pc){
+              try{ await entry.pc.addIceCandidate(sig.candidate); }catch(e){ console.warn(e); }
+            } else {
+              entry.pendingIce = entry.pendingIce || [];
+              entry.pendingIce.push(sig.candidate);
+            }
+          }
         }
       });
     }
 
     async function dial(peerId){
-      const pc = await createPeerConnection(peerId);
-      peers.set(peerId, { pc });
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      roomNode(me.room).get('signals').get(peerId).set({ from: me.id, type:'offer', sdp: offer });
+      const entry = ensurePeerRecord(peerId);
+      try{
+        const pc = await createPeerConnection(peerId);
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        roomNode(me.room).get('signals').get(peerId).set({ from: me.id, type:'offer', sdp: offer });
+      } finally {
+        entry.dialing = false;
+      }
     }
 
     // --- Join / Leave ---
     async function join(){
+      if(me.joined){ status(`Already in room: ${me.room}`); return; }
+      if(el.relays){
+        setCustomRelays(parseRelayInput(el.relays.value), { announce: false });
+      }
       const room = (el.room.value || location.hash.slice(1) || 'demo').trim();
       me.room = room; me.name = el.name.value.trim() || `guest-${me.id}`;
       await getUserMediaIfNeeded();
+      me.joined = true;
       startSignaling();
+      subscribeTestClicks(room);
       // Advertise ourselves
       roomNode(room).get('members').get(me.id).put({ name: me.name, at: Date.now() });
-      me.joined = true;
       status(`Joined room: ${room} as ${me.name}`);
       el.join.disabled = true; el.leave.disabled = false;
+      el.test.disabled = false;
+      updateTestButton();
       history.replaceState(null, '', `#${encodeURIComponent(room)}`);
     }
 
@@ -243,8 +628,18 @@
       // Stop screen
       if(screenStream){ screenStream.getTracks().forEach(t=>t.stop()); screenStream=null; }
       // Remove from room
-      if(me.room) roomNode(me.room).get('members').get(me.id).put(null);
+      if(me.room){
+        roomNode(me.room).get('members').get(me.id).put(null);
+        roomNode(me.room).get('testClicks').get(me.id).put(null);
+      }
+      me.room = null;
       el.join.disabled = false; el.leave.disabled = true;
+      el.test.disabled = true;
+      if(testWatcher && typeof testWatcher.off === 'function'){ testWatcher.off(); }
+      testWatcher = null;
+      if(testInitTimer){ clearTimeout(testInitTimer); testInitTimer = null; }
+      testClicks.clear();
+      setTestState(0, null, null);
       status('Left room.');
     }
 
@@ -280,8 +675,26 @@
           });
         } else {
           screenStream.getTracks().forEach(t=>t.stop()); screenStream=null; removeVideoTile('screen');
-        }
-      }catch(e){ console.error(e); status('Screen share blocked.'); }
+      }
+    }catch(e){ console.error(e); status('Screen share blocked.'); }
+    };
+
+    el.test.onclick = ()=>{
+      if(el.test.disabled || !me.joined || !me.room) return;
+      const current = testClicks.get(me.id);
+      const nextCount = (current?.count || 0) + 1;
+      const payload = {
+        by: me.id,
+        name: me.name,
+        count: nextCount,
+        at: Date.now()
+      };
+      testClicks.set(me.id, payload);
+      const prevTotal = testState.count;
+      recomputeTestState();
+      const label = testState.count > prevTotal ? `#${testState.count}` : '';
+      status(`Logged test click ${label}`.trim());
+      roomNode(me.room).get('testClicks').get(me.id).put(payload);
     };
 
     // --- Recording (client-side) ---
@@ -357,6 +770,8 @@
       const a = document.createElement('a'); a.href=url; a.download=`3dvr-meet-${Date.now()}.webm`; a.click();
       setTimeout(()=>URL.revokeObjectURL(url), 30000);
     }
+
+    updateTestButton();
 
     // Auto-fill room from hash
     window.addEventListener('DOMContentLoaded',()=>{
